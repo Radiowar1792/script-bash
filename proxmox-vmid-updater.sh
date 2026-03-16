@@ -4,10 +4,7 @@ set -euo pipefail
 
 # ============================================================
 # PROXMOX VMID UPDATER - Script Personnalisé
-# Auteur: Radiowar1792
-# Version: 2.0
-# Description: Changement d'IDs LXC/VM sur noeuds Proxmox
-#              avec vérifications de sécurité et logs
+# Version: 2.2 (Bugfix NODE_ASSIGNED + Rollback + Dry-run)
 # ============================================================
 
 # ─────────────────────────────────────────
@@ -18,28 +15,30 @@ LOGFILE="$LOGDIR/rename-vmid-$(date '+%Y%m%d_%H%M%S').log"
 mkdir -p "$LOGDIR"
 touch "$LOGFILE"
 
-# Couleurs pour affichage terminal
+# Mode dry-run (simulation)
+DRY_RUN=false
+
+# Couleurs
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 log() {
-    local level="${1:-INFO}"
+    local level="$1"
     shift
-    local ts msg
+    local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    msg="[$ts] [$level] $*"
-    echo "$msg" >> "$LOGFILE"
+    echo "[$ts] [$level] $*" >> "$LOGFILE"
     case "$level" in
         INFO)    echo -e "${CYAN}[INFO]${NC} $*" ;;
-        SUCCESS) echo -e "${GREEN}[✔ OK]${NC} $*" ;;
-        WARN)    echo -e "${YELLOW}[⚠ WARN]${NC} $*" ;;
-        ERROR)   echo -e "${RED}[✖ ERROR]${NC} $*" >&2 ;;
-        *)       echo "$msg" ;;
+        SUCCESS) echo -e "${GREEN}[OK]${NC} $*" ;;
+        WARN)    echo -e "${YELLOW}[WARN]${NC} $*" ;;
+        ERROR)   echo -e "${RED}[ERROR]${NC} $*" >&2 ;;
+        DRYRUN)  echo -e "${YELLOW}[DRY-RUN]${NC} $*" ;;
     esac
 }
 
@@ -52,10 +51,10 @@ log_separator() {
 # ─────────────────────────────────────────
 check_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
-        echo -e "${RED}❌ Ce script doit être exécuté en tant que root!${NC}" >&2
+        echo -e "${RED}Ce script doit être exécuté en tant que root!${NC}" >&2
         exit 1
     fi
-    log "INFO" "Exécution en tant que root confirmée"
+    log "INFO" "Exécution root confirmée"
 }
 
 # ─────────────────────────────────────────
@@ -63,17 +62,15 @@ check_root() {
 # ─────────────────────────────────────────
 check_dependencies() {
     local NEEDS=()
-    for cmd in dialog pvesh pvecm pvesm; do
+    for cmd in dialog pvesh; do
         command -v "$cmd" > /dev/null 2>&1 || NEEDS+=("$cmd")
     done
 
     if (( ${#NEEDS[@]} > 0 )); then
         log "WARN" "Paquets manquants: ${NEEDS[*]}"
-        echo -e "${YELLOW}Paquets manquants: ${NEEDS[*]}${NC}"
         read -rp "Installer via apt? [O/n] " ans
         ans=${ans:-O}
         if [[ "$ans" =~ ^[OoYy]$ ]]; then
-            log "INFO" "Installation: ${NEEDS[*]}"
             apt update && apt install -y "${NEEDS[@]}"
             log "SUCCESS" "Dépendances installées"
         else
@@ -86,77 +83,71 @@ check_dependencies() {
 }
 
 # ─────────────────────────────────────────
-# 🖥️ BANNIÈRE D'ACCUEIL
+# 🖥️ BANNIÈRE
 # ─────────────────────────────────────────
 show_banner() {
     clear
     echo -e "${BOLD}${BLUE}"
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║        🖥️  PROXMOX VMID UPDATER - v2.0              ║"
+    echo "║        PROXMOX VMID UPDATER - v2.2                  ║"
     echo "║     Changement d'IDs LXC/VM sur noeuds Proxmox      ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo -e "${YELLOW}📝 Log: $LOGFILE${NC}"
+    echo -e "${YELLOW}Log: $LOGFILE${NC}"
     echo ""
 }
 
 # ─────────────────────────────────────────
-# ⚠️ AVERTISSEMENT DE SÉCURITÉ
+# ⚠️ AVERTISSEMENT
 # ─────────────────────────────────────────
 show_warning() {
-    dialog --title "⚠️  AVERTISSEMENT - UTILISATION À VOS RISQUES!" \
+    dialog --title "AVERTISSEMENT" \
         --yes-label "Je comprends, Continuer" \
         --no-label "Annuler" \
         --yesno "\
-╔══════════════════════════════════════════╗
-║         ⚠️  ATTENTION IMPORTANTE        ║
-╚══════════════════════════════════════════╝
+ATTENTION IMPORTANTE
 
 Ce script modifie les VMIDs Proxmox (LXC et VM).
 
-⚠️  RISQUES POTENTIELS:
-  • Corruption de config si mal utilisé
-  • Perte de données si VM en cours d'exécution
-  • Problèmes de cluster si pas de quorum
+RISQUES POTENTIELS:
+  - Corruption de config si mal utilisé
+  - Perte de données si VM en cours d'execution
+  - Problemes de cluster si pas de quorum
 
-✅ PRÉCAUTIONS PRISES:
-  • Vérification que la VM/LXC est arrêtée
-  • Sauvegarde automatique des configs
-  • Vérification du quorum cluster
-  • Logs détaillés de toutes les opérations
+PRECAUTIONS PRISES:
+  - Verification que la VM/LXC est arretee
+  - Sauvegarde automatique des configs
+  - Rollback automatique en cas d'erreur
+  - Logs detailles de toutes les operations
 
-📋 AVANT DE CONTINUER:
-  • Faites un snapshot/backup de vos VMs
-  • Assurez-vous que les VMs sont arrêtées
-  • Vérifiez que le cluster est en bonne santé
+AVANT DE CONTINUER:
+  - Faites un snapshot/backup de vos VMs
+  - Assurez-vous que les VMs sont arretees
+  - Verifiez que le cluster est en bonne sante" \
+        22 60 || { log "INFO" "Annulé par utilisateur"; clear; exit 0; }
 
-Continuez seulement si vous savez ce que vous faites!" \
-        20 60 || { log "INFO" "Utilisateur a annulé au warning"; clear; exit 0; }
-    
-    log "INFO" "Utilisateur a accepté les avertissements"
+    log "INFO" "Avertissements acceptés"
 }
 
 # ─────────────────────────────────────────
-# 🌐 DÉTECTION DES NOEUDS CLUSTER
+# 🌐 DÉTECTION DES NOEUDS
 # ─────────────────────────────────────────
 detect_cluster_nodes() {
     CLUSTER_NODES=()
-    
+
     if pvecm nodes &>/dev/null 2>&1; then
-        mapfile -t CLUSTER_NODES < <(
-            pvesh get /nodes --output-format=json 2>/dev/null \
-            | grep -Po '"node"\s*:\s*"\K[^"]+'
-        )
-        log "INFO" "Mode Cluster détecté - Noeuds: ${CLUSTER_NODES[*]}"
-    else
+        while IFS= read -r node; do
+            [[ -n "$node" ]] && CLUSTER_NODES+=("$node")
+        done < <(pvesh get /nodes --output-format=json 2>/dev/null \
+            | grep -Po '"node"\s*:\s*"\K[^"]+')
+        log "INFO" "Cluster détecté - Noeuds: ${CLUSTER_NODES[*]}"
+    fi
+
+    if (( ${#CLUSTER_NODES[@]} == 0 )); then
+        local THIS_NODE
         THIS_NODE=$(hostname -s)
         CLUSTER_NODES=("$THIS_NODE")
-        log "INFO" "Mode Standalone - Noeud local: $THIS_NODE"
-    fi
-    
-    if (( ${#CLUSTER_NODES[@]} == 0 )); then
-        log "ERROR" "Aucun noeud détecté!"
-        exit 1
+        log "INFO" "Mode standalone - Noeud: $THIS_NODE"
     fi
 }
 
@@ -165,133 +156,118 @@ detect_cluster_nodes() {
 # ─────────────────────────────────────────
 check_quorum() {
     if (( ${#CLUSTER_NODES[@]} <= 1 )); then
-        log "INFO" "Mode standalone - vérification quorum ignorée"
+        log "INFO" "Standalone - vérification quorum ignorée"
         return 0
     fi
 
-    set +e
-    RAW_STATUS=$(pvecm status 2>&1)
-    RETVAL=$?
-    set -e
-
-    if (( RETVAL != 0 )); then
-        QSTAT="No"
-        log "WARN" "pvecm status échoué (exit $RETVAL), pas de quorum assumé"
-    else
-        QSTAT=$(awk -F: '/Quorate:/ {
-            gsub(/^[ \t]+|[ \t]+$/, "", $2)
-            print $2
-        }' <<< "$RAW_STATUS")
-        log "INFO" "Statut quorum cluster: $QSTAT"
-    fi
+    local QSTAT
+    QSTAT=$(pvecm status 2>/dev/null | awk -F: '/Quorate:/ {
+        gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2
+    }' || echo "No")
 
     if [[ "$QSTAT" != "Yes" ]]; then
-        dialog --title "❌ Pas de Quorum Cluster" \
-            --msgbox "\
-Le cluster n'a pas le quorum (Quorate: $QSTAT).
-
-Veuillez restaurer le quorum avant de continuer.
-
-Commandes utiles:
-  pvecm status
-  systemctl status corosync
-  systemctl status pve-cluster" \
-            12 60
-        log "ERROR" "Cluster sans quorum ($QSTAT) - abandon"
+        dialog --title "Pas de Quorum" \
+            --msgbox "Le cluster n'a pas le quorum.\nVeuillez restaurer le quorum avant de continuer." \
+            8 55
+        log "ERROR" "Pas de quorum - abandon"
         clear
         exit 1
     fi
-    
+
     log "SUCCESS" "Quorum cluster OK"
 }
 
 # ─────────────────────────────────────────
-# 📋 AFFICHER TOUTES LES VMs/LXCs
+# 📋 LISTER LES VMs/LXCs
 # ─────────────────────────────────────────
 list_all_vms() {
-    log_separator
-    log "INFO" "Liste de toutes les VMs/LXCs disponibles:"
-    
+    log "INFO" "Liste de toutes les VMs/LXCs"
     local list_content=""
-    
+
     for NODE in "${CLUSTER_NODES[@]}"; do
-        log "INFO" "Scan du noeud: $NODE"
-        
-        # VMs QEMU
-        local qemu_list
-        qemu_list=$(pvesh get "/nodes/$NODE/qemu" --output-format=json 2>/dev/null \
-            | grep -Po '"vmid"\s*:\s*\K[0-9]+' || echo "")
-        
-        # LXC Containers
-        local lxc_list
-        lxc_list=$(pvesh get "/nodes/$NODE/lxc" --output-format=json 2>/dev/null \
-            | grep -Po '"vmid"\s*:\s*\K[0-9]+' || echo "")
-        
-        if [[ -n "$qemu_list" ]]; then
-            for vmid in $qemu_list; do
+        list_content+="=== Noeud: $NODE ===\n"
+
+        local qemu_ids
+        qemu_ids=$(pvesh get "/nodes/$NODE/qemu" --output-format=json 2>/dev/null \
+            | grep -Po '"vmid"\s*:\s*\K[0-9]+' || true)
+
+        if [[ -n "$qemu_ids" ]]; then
+            while IFS= read -r vmid; do
                 local name status
-                name=$(pvesh get "/nodes/$NODE/qemu/$vmid/config" --output-format=json 2>/dev/null \
+                name=$(pvesh get "/nodes/$NODE/qemu/$vmid/config" \
+                    --output-format=json 2>/dev/null \
                     | grep -Po '"name"\s*:\s*"\K[^"]+' | head -1 || echo "N/A")
-                status=$(pvesh get "/nodes/$NODE/qemu/$vmid/status/current" --output-format=json 2>/dev/null \
+                status=$(pvesh get "/nodes/$NODE/qemu/$vmid/status/current" \
+                    --output-format=json 2>/dev/null \
                     | grep -Po '"status"\s*:\s*"\K[^"]+' | head -1 || echo "unknown")
-                list_content+="  [QEMU] ID: ${vmid} | Nom: ${name} | Status: ${status} | Noeud: ${NODE}\n"
-            done
+                list_content+="  [QEMU] ID: $vmid | Nom: $name | Status: $status\n"
+            done <<< "$qemu_ids"
         fi
-        
-        if [[ -n "$lxc_list" ]]; then
-            for vmid in $lxc_list; do
+
+        local lxc_ids
+        lxc_ids=$(pvesh get "/nodes/$NODE/lxc" --output-format=json 2>/dev/null \
+            | grep -Po '"vmid"\s*:\s*\K[0-9]+' || true)
+
+        if [[ -n "$lxc_ids" ]]; then
+            while IFS= read -r vmid; do
                 local name status
-                name=$(pvesh get "/nodes/$NODE/lxc/$vmid/config" --output-format=json 2>/dev/null \
+                name=$(pvesh get "/nodes/$NODE/lxc/$vmid/config" \
+                    --output-format=json 2>/dev/null \
                     | grep -Po '"hostname"\s*:\s*"\K[^"]+' | head -1 || echo "N/A")
-                status=$(pvesh get "/nodes/$NODE/lxc/$vmid/status/current" --output-format=json 2>/dev/null \
+                status=$(pvesh get "/nodes/$NODE/lxc/$vmid/status/current" \
+                    --output-format=json 2>/dev/null \
                     | grep -Po '"status"\s*:\s*"\K[^"]+' | head -1 || echo "unknown")
-                list_content+="  [LXC]  ID: ${vmid} | Nom: ${name} | Status: ${status} | Noeud: ${NODE}\n"
-            done
+                list_content+="  [LXC]  ID: $vmid | Nom: $name | Status: $status\n"
+            done <<< "$lxc_ids"
         fi
+
+        list_content+="\n"
     done
-    
-    if [[ -z "$list_content" ]]; then
-        list_content="  Aucune VM ou LXC trouvée.\n"
-    fi
-    
-    dialog --title "📋 VMs et LXCs disponibles" \
+
+    [[ -z "$list_content" ]] && list_content="Aucune VM ou LXC trouvée."
+
+    dialog --title "VMs et LXCs disponibles" \
         --msgbox "$(echo -e "$list_content")" \
         30 80
 }
 
 # ─────────────────────────────────────────
-# 🔍 RECHERCHER UN VMID SUR LES NOEUDS
+# 🔍 RECHERCHER UN VMID
+# ─────────────────────────────────────────
+# ⚠️  NE PAS appeler depuis un subshell $() !
+#     Les variables globales NODE_ASSIGNED et TYPE
+#     doivent être capturées IMMÉDIATEMENT après l'appel.
 # ─────────────────────────────────────────
 find_vmid() {
     local ID_SEARCH="$1"
+
+    # Reset explicite des globales
     NODE_ASSIGNED=""
     TYPE=""
-    
-    log "INFO" "Recherche du VMID $ID_SEARCH sur les noeuds: ${CLUSTER_NODES[*]}"
-    
-    # Recherche QEMU
+
     for N in "${CLUSTER_NODES[@]}"; do
-        log "INFO" "Vérification QEMU VM $ID_SEARCH sur noeud $N"
-        if pvesh get "/nodes/$N/qemu/$ID_SEARCH/config" &>/dev/null; then
-            TYPE=qemu
-            NODE_ASSIGNED=$N
-            log "SUCCESS" "VM QEMU $ID_SEARCH trouvée sur noeud $N"
+        if pvesh get "/nodes/$N/qemu/$ID_SEARCH/config" \
+               --output-format=json &>/dev/null 2>&1; then
+            TYPE="qemu"
+            NODE_ASSIGNED="$N"
+            log "SUCCESS" "VM QEMU $ID_SEARCH trouvée sur $N"
             return 0
         fi
     done
-    
-    # Recherche LXC
+
     for N in "${CLUSTER_NODES[@]}"; do
-        log "INFO" "Vérification LXC CT $ID_SEARCH sur noeud $N"
-        if pvesh get "/nodes/$N/lxc/$ID_SEARCH/config" &>/dev/null; then
-            TYPE=lxc
-            NODE_ASSIGNED=$N
-            log "SUCCESS" "LXC CT $ID_SEARCH trouvée sur noeud $N"
+        if pvesh get "/nodes/$N/lxc/$ID_SEARCH/config" \
+               --output-format=json &>/dev/null 2>&1; then
+            TYPE="lxc"
+            NODE_ASSIGNED="$N"
+            log "SUCCESS" "LXC $ID_SEARCH trouvée sur $N"
             return 0
         fi
     done
-    
+
     log "WARN" "VMID $ID_SEARCH non trouvé sur aucun noeud"
+    NODE_ASSIGNED=""
+    TYPE=""
     return 1
 }
 
@@ -303,21 +279,54 @@ check_vm_stopped() {
     local vmid="$2"
     local type="$3"
     local status
-    
+
     status=$(pvesh get "/nodes/$node/$type/$vmid/status/current" \
         --output-format=json 2>/dev/null \
         | grep -Po '"status"\s*:\s*"\K[^"]+' | head -1 || echo "unknown")
-    
-    log "INFO" "Status de $type $vmid sur $node: $status"
-    
-    if [[ "$status" != "stopped" ]]; then
-        return 1
+
+    log "INFO" "Status $type $vmid sur $node: $status"
+    [[ "$status" == "stopped" ]]
+}
+
+# ─────────────────────────────────────────
+# 📸 VÉRIFIER LES SNAPSHOTS
+# ─────────────────────────────────────────
+check_snapshots() {
+    local node="$1"
+    local vmid="$2"
+    local type="$3"
+
+    local snaps
+    snaps=$(pvesh get "/nodes/$node/$type/$vmid/snapshot" \
+        --output-format=json 2>/dev/null \
+        | grep -Po '"name"\s*:\s*"\K[^"]+' \
+        | grep -v "^current$" || true)
+
+    if [[ -n "$snaps" ]]; then
+        local snap_count
+        snap_count=$(echo "$snaps" | wc -l)
+        log "WARN" "$type $vmid a $snap_count snapshot(s): $(echo "$snaps" | tr '\n' ' ')"
+
+        dialog --title "Snapshots détectés" \
+            --yes-label "Continuer quand même" \
+            --no-label "Annuler" \
+            --yesno "\
+Attention: $type $vmid possède $snap_count snapshot(s):
+
+$(echo "$snaps" | sed 's/^/  - /')
+
+Les snapshots NE SERONT PAS renommés automatiquement.
+Cela peut causer des incohérences.
+
+Voulez-vous continuer malgré tout?" \
+            18 60 || return 1
     fi
+
     return 0
 }
 
 # ─────────────────────────────────────────
-# 💾 SAUVEGARDER LA CONFIGURATION
+# 💾 SAUVEGARDER LA CONFIG
 # ─────────────────────────────────────────
 backup_config() {
     local node="$1"
@@ -325,210 +334,290 @@ backup_config() {
     local type="$3"
     local BACKUP_DIR="/var/lib/proxmox-vmid-backups"
     local BACKUP_FILE="$BACKUP_DIR/${type}_${vmid}_$(date '+%Y%m%d_%H%M%S').conf.bak"
-    
-    mkdir -p "$BACKUP_DIR"
-    
-    # Chemin config selon type
     local CONFIG_PATH
+
+    mkdir -p "$BACKUP_DIR"
+
     if [[ "$type" == "qemu" ]]; then
         CONFIG_PATH="/etc/pve/nodes/$node/qemu-server/$vmid.conf"
     else
         CONFIG_PATH="/etc/pve/nodes/$node/lxc/$vmid.conf"
     fi
-    
+
     if [[ -f "$CONFIG_PATH" ]]; then
         cp "$CONFIG_PATH" "$BACKUP_FILE"
         log "SUCCESS" "Config sauvegardée: $BACKUP_FILE"
         echo "$BACKUP_FILE"
     else
-        log "WARN" "Config non trouvée: $CONFIG_PATH"
+        log "WARN" "Config non trouvée pour backup: $CONFIG_PATH"
         echo ""
     fi
 }
 
 # ─────────────────────────────────────────
-# 🔄 RENOMMER UN VMID - FONCTION PRINCIPALE
+# ↩️  ROLLBACK
 # ─────────────────────────────────────────
-rename_vmid() {
+rollback_rename() {
     local ID_OLD="$1"
     local ID_NEW="$2"
     local TYPE="$3"
     local NODE="$4"
+    local BACKUP_FILE="$5"
     local LOCAL_NODE
     LOCAL_NODE=$(hostname -s)
-    
-    log_separator
-    log "INFO" "Début du renommage: $TYPE $ID_OLD → $ID_NEW sur noeud $NODE"
-    
-    # ── Chemins des configs ──
-    local CONF_DIR_OLD CONF_DIR_NEW CONF_OLD CONF_NEW
+
+    log "WARN" "=== ROLLBACK: $TYPE $ID_NEW → $ID_OLD sur $NODE ==="
+
+    local CONF_DIR CONF_NEW CONF_OLD
     if [[ "$TYPE" == "qemu" ]]; then
-        CONF_DIR_OLD="/etc/pve/nodes/$NODE/qemu-server"
-        CONF_OLD="$CONF_DIR_OLD/$ID_OLD.conf"
-        CONF_NEW="$CONF_DIR_OLD/$ID_NEW.conf"
+        CONF_DIR="/etc/pve/nodes/$NODE/qemu-server"
     else
-        CONF_DIR_OLD="/etc/pve/nodes/$NODE/lxc"
-        CONF_OLD="$CONF_DIR_OLD/$ID_OLD.conf"
-        CONF_NEW="$CONF_DIR_OLD/$ID_NEW.conf"
+        CONF_DIR="/etc/pve/nodes/$NODE/lxc"
     fi
-    
-    # ── Vérification que la config existe ──
-    if [[ ! -f "$CONF_OLD" ]]; then
-        log "ERROR" "Fichier config introuvable: $CONF_OLD"
-        dialog --title "❌ Erreur" \
-            --msgbox "Config introuvable: $CONF_OLD\n\nAbandon de l'opération." \
-            8 60
-        return 1
-    fi
-    
-    # ── Sauvegarde de la config ──
-    local BACKUP_FILE
-    BACKUP_FILE=$(backup_config "$NODE" "$ID_OLD" "$TYPE")
-    
-    # ── Renommage sur noeud LOCAL ──
-    if [[ "$NODE" == "$LOCAL_NODE" ]]; then
-        log "INFO" "Renommage LOCAL sur $NODE"
-        
-        # 1. Copier la config avec le nouvel ID
-        cp "$CONF_OLD" "$CONF_NEW"
-        log "SUCCESS" "Config copiée: $CONF_OLD → $CONF_NEW"
-        
-        # 2. Mettre à jour les références internes au vieil ID
-        sed -i "s|/$ID_OLD/|/$ID_NEW/|g" "$CONF_NEW"
-        sed -i "s|-$ID_OLD-|-$ID_NEW-|g" "$CONF_NEW"
-        log "INFO" "Références internes mises à jour dans $CONF_NEW"
-        
-        # 3. Renommer les volumes de stockage
-        rename_storage_volumes "$ID_OLD" "$ID_NEW" "$TYPE" "$NODE" "$CONF_NEW"
-        
-        # 4. Supprimer l'ancienne config
-        rm -f "$CONF_OLD"
-        log "SUCCESS" "Ancienne config supprimée: $CONF_OLD"
-        
+    CONF_NEW="$CONF_DIR/$ID_NEW.conf"
+    CONF_OLD="$CONF_DIR/$ID_OLD.conf"
+
+    # Restaurer depuis backup si dispo
+    if [[ -n "$BACKUP_FILE" && -f "$BACKUP_FILE" ]]; then
+        if [[ "$NODE" == "$LOCAL_NODE" ]]; then
+            cp "$BACKUP_FILE" "$CONF_OLD"
+            rm -f "$CONF_NEW"
+            log "SUCCESS" "Config restaurée depuis backup: $BACKUP_FILE"
+        else
+            scp "$BACKUP_FILE" "root@$NODE:$CONF_OLD" &>/dev/null
+            ssh -o StrictHostKeyChecking=no "root@$NODE" "rm -f '$CONF_NEW'"
+            log "SUCCESS" "Config distante restaurée depuis backup"
+        fi
     else
-        # ── Renommage sur noeud DISTANT via SSH ──
-        log "INFO" "Renommage DISTANT sur $NODE via SSH"
-        
-        ssh -o StrictHostKeyChecking=no "root@$NODE" bash <<EOF
-            set -euo pipefail
-            cp "$CONF_OLD" "$CONF_NEW"
-            sed -i "s|/$ID_OLD/|/$ID_NEW/|g" "$CONF_NEW"
-            sed -i "s|-$ID_OLD-|-$ID_NEW-|g" "$CONF_NEW"
-            rm -f "$CONF_OLD"
-            echo "Renommage distant OK"
-EOF
-        log "SUCCESS" "Renommage distant OK sur $NODE"
-        
-        # Renommage des volumes distant
-        rename_storage_volumes_remote "$ID_OLD" "$ID_NEW" "$TYPE" "$NODE"
+        # Pas de backup: tenter de renommer en sens inverse
+        if [[ -f "$CONF_NEW" ]]; then
+            if [[ "$NODE" == "$LOCAL_NODE" ]]; then
+                mv "$CONF_NEW" "$CONF_OLD"
+                sed -i "s|/$ID_NEW/|/$ID_OLD/|g" "$CONF_OLD"
+                sed -i "s|-$ID_NEW-|-$ID_OLD-|g" "$CONF_OLD"
+                sed -i "s|:$ID_NEW/|:$ID_OLD/|g" "$CONF_OLD"
+            else
+                ssh -o StrictHostKeyChecking=no "root@$NODE" \
+                    "mv '$CONF_NEW' '$CONF_OLD' && \
+                     sed -i 's|/$ID_NEW/|/$ID_OLD/|g' '$CONF_OLD' && \
+                     sed -i 's|-$ID_NEW-|-$ID_OLD-|g' '$CONF_OLD' && \
+                     sed -i 's|:$ID_NEW/|:$ID_OLD/|g' '$CONF_OLD'"
+            fi
+            log "SUCCESS" "Config renommée en sens inverse (sans backup)"
+        fi
     fi
-    
-    log "SUCCESS" "Renommage terminé: $TYPE $ID_OLD → $ID_NEW"
-    log "INFO" "Backup conservé: $BACKUP_FILE"
-    
-    return 0
+
+    # Rollback volumes de stockage
+    log "WARN" "Rollback des volumes: $ID_NEW → $ID_OLD"
+    rename_storage_volumes "$ID_NEW" "$ID_OLD" "$NODE"
+
+    log "WARN" "=== ROLLBACK TERMINÉ ==="
 }
 
 # ─────────────────────────────────────────
-# 💽 RENOMMER LES VOLUMES DE STOCKAGE (LOCAL)
+# 💽 RENOMMER LES VOLUMES DE STOCKAGE
+#    Gère local, ZFS et Ceph
 # ─────────────────────────────────────────
 rename_storage_volumes() {
     local ID_OLD="$1"
     local ID_NEW="$2"
-    local TYPE="$3"
-    local NODE="$4"
-    local CONF_FILE="$5"
-    
-    log "INFO" "Scan des volumes de stockage pour $TYPE $ID_OLD"
-    
-    # Récupérer les storages disponibles
-    local STORAGES
-    mapfile -t STORAGES < <(pvesm status --output-format=json 2>/dev/null \
-        | grep -Po '"storage"\s*:\s*"\K[^"]+' || echo "")
-    
-    for STORAGE in "${STORAGES[@]}"; do
-        local STORAGE_PATH
-        STORAGE_PATH=$(pvesm path "$STORAGE:" 2>/dev/null | head -1 || echo "")
-        
-        [[ -z "$STORAGE_PATH" ]] && continue
-        
-        # Chercher les volumes avec l'ancien ID
-        local OLD_PATTERNS=()
-        
-        if [[ "$TYPE" == "qemu" ]]; then
-            # Patterns pour disques VM
-            OLD_PATTERNS+=(
-                "$STORAGE_PATH/images/$ID_OLD"
-                "$STORAGE_PATH/vm-$ID_OLD-disk"
-                "$STORAGE_PATH/base-$ID_OLD-disk"
-            )
-        else
-            # Patterns pour LXC
-            OLD_PATTERNS+=(
-                "$STORAGE_PATH/images/$ID_OLD"
-                "$STORAGE_PATH/subvol-$ID_OLD-disk"
-                "$STORAGE_PATH/basevol-$ID_OLD-disk"
-            )
-        fi
-        
-        for PATTERN in "${OLD_PATTERNS[@]}"; do
-            # Renommer les dossiers
-            if [[ -d "$PATTERN" ]]; then
-                local NEW_PATH="${PATTERN/$ID_OLD/$ID_NEW}"
-                mv "$PATTERN" "$NEW_PATH"
-                log "SUCCESS" "Dossier renommé: $PATTERN → $NEW_PATH"
-            fi
-            
-            # Renommer les fichiers (images disques)
-            for OLD_FILE in "${PATTERN}"* 2>/dev/null; do
-                [[ -e "$OLD_FILE" ]] || continue
-                local NEW_FILE="${OLD_FILE/$ID_OLD/$ID_NEW}"
-                if [[ "$OLD_FILE" != "$NEW_FILE" ]]; then
-                    mv "$OLD_FILE" "$NEW_FILE"
-                    log "SUCCESS" "Fichier renommé: $OLD_FILE → $NEW_FILE"
+    local NODE="$3"
+    local LOCAL_NODE
+    LOCAL_NODE=$(hostname -s)
+
+    log "INFO" "Renommage des volumes: $ID_OLD → $ID_NEW sur $NODE"
+
+    _do_rename_volumes() {
+        local search_dirs=("/var/lib/vz" "/mnt/pve")
+
+        for base_dir in "${search_dirs[@]}"; do
+            [[ ! -d "$base_dir" ]] && continue
+
+            # Dossiers
+            while IFS= read -r found_dir; do
+                local new_dir="${found_dir//$ID_OLD/$ID_NEW}"
+                if [[ "$found_dir" != "$new_dir" ]]; then
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        log "DRYRUN" "mv dossier: $found_dir → $new_dir"
+                    else
+                        mv "$found_dir" "$new_dir"
+                        log "SUCCESS" "Dossier: $found_dir → $new_dir"
+                    fi
                 fi
-            done
+            done < <(find "$base_dir" -maxdepth 5 -type d -name "*${ID_OLD}*" 2>/dev/null || true)
+
+            # Fichiers
+            while IFS= read -r found_file; do
+                local new_file="${found_file//$ID_OLD/$ID_NEW}"
+                if [[ "$found_file" != "$new_file" ]]; then
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        log "DRYRUN" "mv fichier: $found_file → $new_file"
+                    else
+                        mv "$found_file" "$new_file"
+                        log "SUCCESS" "Fichier: $found_file → $new_file"
+                    fi
+                fi
+            done < <(find "$base_dir" -maxdepth 5 -type f -name "*${ID_OLD}*" 2>/dev/null || true)
         done
-    done
-    
-    log "INFO" "Renommage des volumes terminé"
+    }
+
+    # ── ZFS ──
+    _rename_zfs_volumes() {
+        if command -v zfs &>/dev/null; then
+            while IFS= read -r zvol; do
+                local new_zvol="${zvol//$ID_OLD/$ID_NEW}"
+                if [[ "$zvol" != "$new_zvol" ]]; then
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        log "DRYRUN" "zfs rename: $zvol → $new_zvol"
+                    else
+                        zfs rename "$zvol" "$new_zvol" \
+                            && log "SUCCESS" "ZFS: $zvol → $new_zvol" \
+                            || log "WARN" "ZFS rename échoué: $zvol"
+                    fi
+                fi
+            done < <(zfs list -H -o name 2>/dev/null | grep "$ID_OLD" || true)
+        fi
+    }
+
+    # ── Ceph RBD ──
+    _rename_ceph_volumes() {
+        if command -v rbd &>/dev/null; then
+            local pools
+            pools=$(ceph osd pool ls 2>/dev/null || true)
+            while IFS= read -r pool; do
+                while IFS= read -r img; do
+                    local new_img="${img//$ID_OLD/$ID_NEW}"
+                    if [[ "$img" != "$new_img" ]]; then
+                        if [[ "$DRY_RUN" == "true" ]]; then
+                            log "DRYRUN" "rbd mv: $pool/$img → $pool/$new_img"
+                        else
+                            rbd mv "$pool/$img" "$pool/$new_img" \
+                                && log "SUCCESS" "Ceph RBD: $pool/$img → $pool/$new_img" \
+                                || log "WARN" "RBD rename échoué: $pool/$img"
+                        fi
+                    fi
+                done < <(rbd ls "$pool" 2>/dev/null | grep "$ID_OLD" || true)
+            done <<< "$pools"
+        fi
+    }
+
+    if [[ "$NODE" == "$LOCAL_NODE" ]]; then
+        _do_rename_volumes
+        _rename_zfs_volumes
+        _rename_ceph_volumes
+    else
+        ssh -o StrictHostKeyChecking=no "root@$NODE" \
+            "find /var/lib/vz /mnt/pve -maxdepth 5 \
+             \( -name '*${ID_OLD}*' \) 2>/dev/null | \
+             while IFS= read -r f; do \
+                 nf=\"\${f//$ID_OLD/$ID_NEW}\"; \
+                 [ \"\$f\" != \"\$nf\" ] && mv \"\$f\" \"\$nf\" && echo \"Renommé: \$f\"; \
+             done || true" 2>/dev/null \
+            && log "SUCCESS" "Volumes distants renommés sur $NODE" \
+            || log "WARN" "Erreur volumes distants sur $NODE (non bloquant)"
+
+        # ZFS distant
+        ssh -o StrictHostKeyChecking=no "root@$NODE" \
+            "command -v zfs &>/dev/null && \
+             zfs list -H -o name 2>/dev/null | grep '$ID_OLD' | \
+             while IFS= read -r z; do \
+                 nz=\"\${z//$ID_OLD/$ID_NEW}\"; \
+                 [ \"\$z\" != \"\$nz\" ] && zfs rename \"\$z\" \"\$nz\" && echo \"ZFS: \$z\"; \
+             done || true" 2>/dev/null || true
+    fi
+
+    log "INFO" "Renommage volumes terminé"
 }
 
 # ─────────────────────────────────────────
-# 💽 RENOMMER LES VOLUMES DISTANTS (SSH)
+# 🔄 RENOMMER UN VMID
 # ─────────────────────────────────────────
-rename_storage_volumes_remote() {
+rename_vmid() {
     local ID_OLD="$1"
     local ID_NEW="$2"
-    local TYPE="$3"
-    local NODE="$4"
-    
-    log "INFO" "Renommage volumes distants sur $NODE"
-    
-    ssh -o StrictHostKeyChecking=no "root@$NODE" bash <<EOF
-        set -euo pipefail
-        
-        # Recherche et renommage des volumes
-        find /var/lib/vz /mnt -maxdepth 4 -name "*-${ID_OLD}-*" 2>/dev/null | while read -r f; do
-            new_f="\${f//-${ID_OLD}-/-${ID_NEW}-}"
-            if [[ "\$f" != "\$new_f" ]]; then
-                mv "\$f" "\$new_f"
-                echo "Renommé: \$f → \$new_f"
-            fi
-        done
-        
-        find /var/lib/vz /mnt -maxdepth 4 -name "*/${ID_OLD}" -type d 2>/dev/null | while read -r d; do
-            new_d="\${d//${ID_OLD}/${ID_NEW}}"
-            if [[ "\$d" != "\$new_d" ]]; then
-                mv "\$d" "\$new_d"
-                echo "Dossier renommé: \$d → \$new_d"
-            fi
-        done
-        
-        echo "Renommage volumes distants terminé"
-EOF
-    
-    log "SUCCESS" "Volumes distants renommés sur $NODE"
+    local TYPE="$3"     # passé explicitement - NE PAS utiliser $TYPE global
+    local NODE="$4"     # passé explicitement - NE PAS utiliser $NODE_ASSIGNED global
+    local LOCAL_NODE
+    LOCAL_NODE=$(hostname -s)
+    local CONF_DIR CONF_OLD CONF_NEW
+
+    log_separator
+    log "INFO" "Renommage: $TYPE $ID_OLD → $ID_NEW sur $NODE"
+
+    # ── Validation des paramètres ──
+    if [[ -z "$TYPE" ]]; then
+        log "ERROR" "TYPE vide - abandon sécurisé"
+        return 1
+    fi
+    if [[ -z "$NODE" ]]; then
+        log "ERROR" "NODE vide - abandon sécurisé"
+        return 1
+    fi
+
+    if [[ "$TYPE" == "qemu" ]]; then
+        CONF_DIR="/etc/pve/nodes/$NODE/qemu-server"
+    else
+        CONF_DIR="/etc/pve/nodes/$NODE/lxc"
+    fi
+
+    CONF_OLD="$CONF_DIR/$ID_OLD.conf"
+    CONF_NEW="$CONF_DIR/$ID_NEW.conf"
+
+    log "INFO" "Config attendue: $CONF_OLD"
+
+    if [[ ! -f "$CONF_OLD" ]]; then
+        log "ERROR" "Config introuvable: $CONF_OLD"
+        dialog --title "Erreur" \
+            --msgbox "Config introuvable:\n$CONF_OLD\n\nVérifiez:\n  - NODE: '$NODE'\n  - TYPE: '$TYPE'\n  - VMID: $ID_OLD" \
+            10 65
+        return 1
+    fi
+
+    # ── Dry-run : simulation uniquement ──
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRYRUN" "cp $CONF_OLD → $CONF_NEW"
+        log "DRYRUN" "sed références $ID_OLD → $ID_NEW dans config"
+        log "DRYRUN" "rename_storage_volumes $ID_OLD → $ID_NEW"
+        log "DRYRUN" "rm $CONF_OLD"
+        log "DRYRUN" "=== Simulation terminée (aucune modification effectuée) ==="
+        return 0
+    fi
+
+    # ── Exécution réelle ──
+    if [[ "$NODE" == "$LOCAL_NODE" ]]; then
+        log "INFO" "Renommage LOCAL sur $NODE"
+
+        cp "$CONF_OLD" "$CONF_NEW" \
+            || { log "ERROR" "Echec copie config"; return 1; }
+        log "SUCCESS" "Config copiée: $ID_OLD.conf → $ID_NEW.conf"
+
+        sed -i "s|/$ID_OLD/|/$ID_NEW/|g" "$CONF_NEW"
+        sed -i "s|-$ID_OLD-|-$ID_NEW-|g" "$CONF_NEW"
+        sed -i "s|:$ID_OLD/|:$ID_NEW/|g" "$CONF_NEW"
+        log "INFO" "Références internes mises à jour"
+
+        rename_storage_volumes "$ID_OLD" "$ID_NEW" "$NODE"
+
+        rm -f "$CONF_OLD"
+        log "SUCCESS" "Ancienne config supprimée: $CONF_OLD"
+
+    else
+        log "INFO" "Renommage DISTANT sur $NODE via SSH"
+
+        ssh -o StrictHostKeyChecking=no "root@$NODE" \
+            "cp \"$CONF_OLD\" \"$CONF_NEW\" && \
+             sed -i \"s|/$ID_OLD/|/$ID_NEW/|g\" \"$CONF_NEW\" && \
+             sed -i \"s|-$ID_OLD-|-$ID_NEW-|g\" \"$CONF_NEW\" && \
+             sed -i \"s|:$ID_OLD/|:$ID_NEW/|g\" \"$CONF_NEW\" && \
+             rm -f \"$CONF_OLD\"" \
+            || { log "ERROR" "Echec SSH sur $NODE"; return 1; }
+
+        log "SUCCESS" "Renommage distant OK sur $NODE"
+        rename_storage_volumes "$ID_OLD" "$ID_NEW" "$NODE"
+    fi
+
+    log "SUCCESS" "Renommage terminé: $TYPE $ID_OLD → $ID_NEW"
+    return 0
 }
 
 # ─────────────────────────────────────────
@@ -540,119 +629,34 @@ show_summary() {
     local TYPE="$3"
     local NODE="$4"
     local BACKUP_FILE="$5"
-    
     local type_label
     [[ "$TYPE" == "qemu" ]] && type_label="VM QEMU" || type_label="LXC Container"
-    
-    dialog --title "✅ Renommage Réussi!" \
+
+    local dry_note=""
+    [[ "$DRY_RUN" == "true" ]] && dry_note="\n⚠️  MODE DRY-RUN - Aucune modification réelle effectuée"
+
+    dialog --title "Renommage Reussi!" \
         --msgbox "\
-╔══════════════════════════════════════════╗
-║           ✅ OPÉRATION RÉUSSIE           ║
-╚══════════════════════════════════════════╝
+OPERATION REUSSIE${dry_note}
 
 Type:      $type_label
 Noeud:     $NODE
 Ancien ID: $ID_OLD
 Nouvel ID: $ID_NEW
 
-📁 Backup config: $BACKUP_FILE
-📝 Log complet:   $LOGFILE
+Backup config: ${BACKUP_FILE:-N/A}
+Log complet:   $LOGFILE
 
-⚡ Prochaines étapes recommandées:
-  1. Vérifiez que la VM/LXC apparaît bien
-  2. Démarrez et testez la VM/LXC
+Prochaines etapes:
+  1. Verifiez que la VM/LXC apparait bien
+  2. Demarrez et testez la VM/LXC
   3. Supprimez le backup si tout est OK
 
-Commande de vérification:
+Commande de verification:
   pvesh get /nodes/$NODE/$TYPE/$ID_NEW/config" \
-        22 65
-    
+        24 65
+
     log "SUCCESS" "=== RENOMMAGE COMPLET: $TYPE $ID_OLD → $ID_NEW sur $NODE ==="
-}
-
-# ─────────────────────────────────────────
-# 🔁 MODE BATCH - Renommages multiples
-# ─────────────────────────────────────────
-batch_rename() {
-    log "INFO" "Mode batch activé"
-    
-    local BATCH_FILE
-    BATCH_FILE=$(dialog --stdout \
-        --title "Mode Batch" \
-        --inputbox "Entrez le chemin vers votre fichier de renommage CSV:\n(Format: OLD_ID,NEW_ID par ligne)" \
-        10 60) || return
-    
-    if [[ ! -f "$BATCH_FILE" ]]; then
-        dialog --msgbox "Fichier non trouvé: $BATCH_FILE" 6 50
-        return
-    fi
-    
-    local SUCCESS_COUNT=0
-    local FAIL_COUNT=0
-    local RESULTS=""
-    
-    while IFS=',' read -r OLD_ID NEW_ID; do
-        # Ignorer commentaires et lignes vides
-        [[ "$OLD_ID" =~ ^#.*$ ]] && continue
-        [[ -z "$OLD_ID" ]] && continue
-        
-        OLD_ID="${OLD_ID// /}"
-        NEW_ID="${NEW_ID// /}"
-        
-        log "INFO" "Batch: traitement $OLD_ID → $NEW_ID"
-        
-        if find_vmid "$OLD_ID"; then
-            if ! check_vm_stopped "$NODE_ASSIGNED" "$OLD_ID" "$TYPE"; then
-                RESULTS+="❌ $OLD_ID → $NEW_ID (VM non arrêtée)\n"
-                (( FAIL_COUNT++ ))
-                continue
-            fi
-            
-            if rename_vmid "$OLD_ID" "$NEW_ID" "$TYPE" "$NODE_ASSIGNED"; then
-                RESULTS+="✅ $OLD_ID → $NEW_ID ($TYPE sur $NODE_ASSIGNED)\n"
-                (( SUCCESS_COUNT++ ))
-            else
-                RESULTS+="❌ $OLD_ID → $NEW_ID (erreur renommage)\n"
-                (( FAIL_COUNT++ ))
-            fi
-        else
-            RESULTS+="❌ $OLD_ID → $NEW_ID (VMID non trouvé)\n"
-            (( FAIL_COUNT++ ))
-        fi
-        
-    done < "$BATCH_FILE"
-    
-    dialog --title "📊 Résultats Batch" \
-        --msgbox "$(echo -e "Résultats:\n\n$RESULTS\n✅ Succès: $SUCCESS_COUNT\n❌ Échecs: $FAIL_COUNT")" \
-        25 70
-}
-
-# ─────────────────────────────────────────
-# 🎮 MENU PRINCIPAL
-# ─────────────────────────────────────────
-main_menu() {
-    while true; do
-        local CHOICE
-        CHOICE=$(dialog --stdout \
-            --title "🖥️ PROXMOX VMID UPDATER - Menu Principal" \
-            --menu "Noeuds détectés: ${CLUSTER_NODES[*]}\nChoisissez une action:" \
-            18 65 6 \
-            "1" "🔄  Renommer un VMID (simple)" \
-            "2" "📋  Lister toutes les VMs/LXCs" \
-            "3" "📦  Mode Batch (CSV)" \
-            "4" "📝  Voir les logs" \
-            "5" "ℹ️   Infos sur un VMID" \
-            "6" "🚪  Quitter") || { clear; exit 0; }
-        
-        case "$CHOICE" in
-            1) single_rename_workflow ;;
-            2) list_all_vms ;;
-            3) batch_rename ;;
-            4) view_logs ;;
-            5) info_vmid ;;
-            6) clear; log "INFO" "Script terminé par l'utilisateur"; exit 0 ;;
-        esac
-    done
 }
 
 # ─────────────────────────────────────────
@@ -661,127 +665,312 @@ main_menu() {
 single_rename_workflow() {
     local LOCAL_NODE
     LOCAL_NODE=$(hostname -s)
-    
-    # ── Saisie de l'ancien VMID ──
+    local ID_OLD ID_NEW
+    local FOUND_NODE FOUND_TYPE   # ← variables LOCALES : contournement du bug subshell
+
+    # ── Saisie ancien VMID ──
     while true; do
         ID_OLD=$(dialog --stdout \
-            --title "Étape 1/3 - Ancien VMID" \
-            --inputbox "Entrez l'ID actuel de la VM/LXC\n(100-1000000, ESC pour annuler):" \
-            9 50) || return
-        
+            --title "Etape 1/3 - Ancien VMID" \
+            --inputbox "Entrez l'ID actuel de la VM/LXC:" \
+            8 50) || return
+
         ID_OLD="${ID_OLD//[$'\t\r\n ']/}"
-        
+
         if ! [[ "$ID_OLD" =~ ^[0-9]+$ ]]; then
-            dialog --msgbox "❌ VMID invalide '$ID_OLD': chiffres uniquement." 6 50
+            dialog --msgbox "VMID invalide: chiffres uniquement." 6 45
             continue
         fi
-        
+
         if (( ID_OLD < 100 || ID_OLD > 1000000 )); then
-            dialog --msgbox "❌ VMID doit être entre 100 et 1000000." 6 50
+            dialog --msgbox "VMID doit etre entre 100 et 1000000." 6 45
             continue
         fi
-        
+
+        # ⚠️  FIX BUG: capturer NODE_ASSIGNED et TYPE IMMÉDIATEMENT
+        #     avant tout appel dialog (qui créerait un subshell)
         if find_vmid "$ID_OLD"; then
+            FOUND_NODE="$NODE_ASSIGNED"   # capture immédiate
+            FOUND_TYPE="$TYPE"            # capture immédiate
+            log "INFO" "Capture: TYPE=$FOUND_TYPE NODE=$FOUND_NODE"
+
+            if [[ -z "$FOUND_NODE" || -z "$FOUND_TYPE" ]]; then
+                log "ERROR" "FOUND_NODE ou FOUND_TYPE vide après find_vmid !"
+                dialog --msgbox "Erreur interne: impossible de déterminer le noeud.\nConsultez: $LOGFILE" 7 55
+                continue
+            fi
             break
         else
-            dialog --msgbox "❌ VMID $ID_OLD non trouvé sur aucun noeud." 6 50
+            dialog --msgbox "VMID $ID_OLD non trouvé sur aucun noeud." 6 50
         fi
     done
-    
-    # ── Afficher infos VM trouvée ──
+
     local type_label
-    [[ "$TYPE" == "qemu" ]] && type_label="VM QEMU" || type_label="LXC Container"
-    
-    dialog --title "✅ VM Trouvée" \
-        --msgbox "VM trouvée:\n\n  Type:  $type_label\n  ID:    $ID_OLD\n  Noeud: $NODE_ASSIGNED" \
-        10 45
-    
-    # ── Vérification que la VM est arrêtée ──
-    if ! check_vm_stopped "$NODE_ASSIGNED" "$ID_OLD" "$TYPE"; then
-        dialog --title "⚠️ VM en cours d'exécution" \
-            --yes-label "Arrêter et continuer" \
+    [[ "$FOUND_TYPE" == "qemu" ]] && type_label="VM QEMU" || type_label="LXC Container"
+
+    dialog --title "VM Trouvee" \
+        --msgbox "VM trouvee:\n\n  Type:  $type_label\n  ID:    $ID_OLD\n  Noeud: $FOUND_NODE" \
+        9 45
+
+    # ── Vérification snapshots ──
+    check_snapshots "$FOUND_NODE" "$ID_OLD" "$FOUND_TYPE" || return
+
+    # ── Vérification VM arrêtée ──
+    if ! check_vm_stopped "$FOUND_NODE" "$ID_OLD" "$FOUND_TYPE"; then
+        dialog --title "VM en cours d'execution" \
+            --yes-label "Arreter et continuer" \
             --no-label "Annuler" \
-            --yesno "La VM $ID_OLD est actuellement en cours d'exécution!\n\nVoulez-vous l'arrêter maintenant?" \
-            8 55 && {
-            log "INFO" "Arrêt de $TYPE $ID_OLD sur $NODE_ASSIGNED"
-            if [[ "$NODE_ASSIGNED" == "$LOCAL_NODE" ]]; then
-                pvesh create "/nodes/$NODE_ASSIGNED/$TYPE/$ID_OLD/status/stop" &>/dev/null
+            --yesno "La VM $ID_OLD est en cours d'execution!\n\nVoulez-vous l'arreter maintenant?" \
+            8 55
+
+        if [[ $? -eq 0 ]]; then
+            log "INFO" "Arrêt de $FOUND_TYPE $ID_OLD sur $FOUND_NODE"
+            if [[ "$FOUND_NODE" == "$LOCAL_NODE" ]]; then
+                pvesh create "/nodes/$FOUND_NODE/$FOUND_TYPE/$ID_OLD/status/stop" \
+                    &>/dev/null || true
             else
-                ssh "root@$NODE_ASSIGNED" \
-                    "pvesh create '/nodes/$NODE_ASSIGNED/$TYPE/$ID_OLD/status/stop'" &>/dev/null
+                ssh "root@$FOUND_NODE" \
+                    "pvesh create '/nodes/$FOUND_NODE/$FOUND_TYPE/$ID_OLD/status/stop'" \
+                    &>/dev/null || true
             fi
             sleep 5
-            log "SUCCESS" "$TYPE $ID_OLD arrêtée"
-        } || return
+            log "SUCCESS" "$FOUND_TYPE $ID_OLD arrêtée"
+        else
+            return
+        fi
     fi
-    
-    # ── Saisie du nouvel VMID ──
+
+    # ── Saisie nouvel VMID ──
     while true; do
         ID_NEW=$(dialog --stdout \
-            --title "Étape 2/3 - Nouvel VMID" \
-            --inputbox "Entrez le NOUVEL ID pour le $type_label $ID_OLD\n(doit être libre et entre 100-1000000):" \
-            9 55) || return
-        
+            --title "Etape 2/3 - Nouvel VMID" \
+            --inputbox "Entrez le NOUVEL ID pour: $type_label $ID_OLD" \
+            8 55) || return
+
         ID_NEW="${ID_NEW//[$'\t\r\n ']/}"
-        
+
         if ! [[ "$ID_NEW" =~ ^[0-9]+$ ]]; then
-            dialog --msgbox "❌ Nouvel ID invalide: chiffres uniquement." 6 50
+            dialog --msgbox "Nouvel ID invalide: chiffres uniquement." 6 50
             continue
         fi
-        
+
         if (( ID_NEW < 100 || ID_NEW > 1000000 )); then
-            dialog --msgbox "❌ VMID doit être entre 100 et 1000000." 6 50
+            dialog --msgbox "VMID doit etre entre 100 et 1000000." 6 45
             continue
         fi
-        
+
         if [[ "$ID_NEW" == "$ID_OLD" ]]; then
-            dialog --msgbox "❌ Le nouvel ID doit être différent de l'ancien!" 6 50
+            dialog --msgbox "Le nouvel ID doit etre different de l'ancien!" 6 50
             continue
         fi
-        
-        # Vérifier que le nouvel ID n'est pas déjà utilisé
+
         if find_vmid "$ID_NEW" 2>/dev/null; then
-            dialog --msgbox "❌ Le VMID $ID_NEW est déjà utilisé sur $NODE_ASSIGNED!" 6 55
+            dialog --msgbox "Le VMID $ID_NEW est deja utilise!" 6 50
             continue
         fi
-        
+
         break
     done
-    
-    # ── Confirmation finale ──
-    dialog --title "⚠️ Étape 3/3 - Confirmation" \
-        --yes-label "✅ Confirmer le renommage" \
-        --no-label "❌ Annuler" \
+
+    # ── Confirmation (avec mention dry-run si actif) ──
+    local dry_label=""
+    [[ "$DRY_RUN" == "true" ]] && dry_label="\n  ⚠️  MODE SIMULATION (dry-run)\n"
+
+    dialog --title "Etape 3/3 - Confirmation" \
+        --yes-label "Confirmer" \
+        --no-label "Annuler" \
         --yesno "\
 Vous allez renommer:
-
+${dry_label}
   Type:        $type_label
-  Noeud:       $NODE_ASSIGNED
+  Noeud:       $FOUND_NODE
   Ancien ID:   $ID_OLD
   Nouvel ID:   $ID_NEW
 
 Cette action va:
-  ✓ Sauvegarder la config actuelle
-  ✓ Renommer le fichier de config
-  ✓ Mettre à jour les chemins de stockage
-  ✓ Logger toutes les opérations
+  - Sauvegarder la config actuelle
+  - Renommer le fichier de config
+  - Mettre a jour les volumes (local/ZFS/Ceph)
+  - Rollback automatique en cas d'erreur
+  - Logger toutes les operations
 
 Confirmez-vous ce renommage?" \
-        20 55 || return
-    
-    # ── Exécution du renommage ──
-    log "INFO" "=== DÉBUT RENOMMAGE: $TYPE $ID_OLD → $ID_NEW ==="
-    
-    local BACKUP_FILE
-    BACKUP_FILE=$(backup_config "$NODE_ASSIGNED" "$ID_OLD" "$TYPE")
-    
-    if rename_vmid "$ID_OLD" "$ID_NEW" "$TYPE" "$NODE_ASSIGNED"; then
-        show_summary "$ID_OLD" "$ID_NEW" "$TYPE" "$NODE_ASSIGNED" "$BACKUP_FILE"
+        22 55 || return
+
+    # ── Exécution avec variables locales explicites ──
+    log_separator
+    log "INFO" "=== DEBUT RENOMMAGE: $FOUND_TYPE $ID_OLD → $ID_NEW sur $FOUND_NODE ==="
+    log "INFO" "Vérification: TYPE='$FOUND_TYPE' | NODE='$FOUND_NODE'"
+
+    local BACKUP_FILE=""
+    if [[ "$DRY_RUN" == "false" ]]; then
+        BACKUP_FILE=$(backup_config "$FOUND_NODE" "$ID_OLD" "$FOUND_TYPE")
+    fi
+
+    if rename_vmid "$ID_OLD" "$ID_NEW" "$FOUND_TYPE" "$FOUND_NODE"; then
+        show_summary "$ID_OLD" "$ID_NEW" "$FOUND_TYPE" "$FOUND_NODE" "$BACKUP_FILE"
     else
-        dialog --title "❌ Erreur" \
-            --msgbox "Le renommage a échoué!\n\nConsultez les logs: $LOGFILE" \
-            8 55
-        log "ERROR" "Renommage échoué: $TYPE $ID_OLD → $ID_NEW"
+        log "ERROR" "Renommage échoué - lancement du rollback"
+
+        # ── Rollback automatique ──
+        if [[ "$DRY_RUN" == "false" ]]; then
+            dialog --title "Erreur - Rollback en cours" \
+                --infobox "Le renommage a echoue!\nRollback automatique en cours..." \
+                5 50
+            sleep 1
+            rollback_rename "$ID_OLD" "$ID_NEW" "$FOUND_TYPE" "$FOUND_NODE" "$BACKUP_FILE"
+        fi
+
+        dialog --title "Erreur" \
+            --msgbox "Le renommage a echoue!\nRollback automatique effectué.\n\nConsultez: $LOGFILE" \
+            8 60
+        log "ERROR" "Renommage échoué + rollback: $FOUND_TYPE $ID_OLD → $ID_NEW"
+    fi
+}
+
+# ─────────────────────────────────────────
+# 📦 MODE BATCH
+# ─────────────────────────────────────────
+batch_rename() {
+    log "INFO" "Mode batch activé"
+
+    local BATCH_FILE
+    BATCH_FILE=$(dialog --stdout \
+        --title "Mode Batch CSV" \
+        --inputbox "Chemin vers le fichier CSV:\n(Format: OLD_ID,NEW_ID par ligne)" \
+        9 60) || return
+
+    if [[ ! -f "$BATCH_FILE" ]]; then
+        dialog --msgbox "Fichier non trouvé: $BATCH_FILE" 6 55
+        return
+    fi
+
+    # Validation préalable du CSV
+    local line_count=0
+    local errors=""
+    while IFS=',' read -r OLD_ID NEW_ID; do
+        [[ "$OLD_ID" =~ ^#.*$ || -z "$OLD_ID" ]] && continue
+        (( line_count++ )) || true
+        OLD_ID="${OLD_ID// /}"
+        NEW_ID="${NEW_ID// /}"
+        if ! [[ "$OLD_ID" =~ ^[0-9]+$ && "$NEW_ID" =~ ^[0-9]+$ ]]; then
+            errors+="Ligne invalide: $OLD_ID,$NEW_ID\n"
+        fi
+    done < "$BATCH_FILE"
+
+    if [[ -n "$errors" ]]; then
+        dialog --title "Erreurs CSV" \
+            --msgbox "Erreurs détectées dans le fichier:\n\n$(echo -e "$errors")\nCorrigez avant de continuer." \
+            15 60
+        return
+    fi
+
+    dialog --title "Confirmation Batch" \
+        --yes-label "Lancer" \
+        --no-label "Annuler" \
+        --yesno "$line_count opération(s) à effectuer.\n\nDry-run actif: $DRY_RUN\n\nConfirmer?" \
+        8 50 || return
+
+    local SUCCESS_COUNT=0
+    local FAIL_COUNT=0
+    local RESULTS=""
+    local FOUND_NODE_B FOUND_TYPE_B   # variables locales batch
+
+    while IFS=',' read -r OLD_ID NEW_ID; do
+        [[ "$OLD_ID" =~ ^#.*$ || -z "$OLD_ID" ]] && continue
+
+        OLD_ID="${OLD_ID// /}"
+        NEW_ID="${NEW_ID// /}"
+
+        log "INFO" "Batch: $OLD_ID → $NEW_ID"
+
+        if find_vmid "$OLD_ID"; then
+            FOUND_NODE_B="$NODE_ASSIGNED"
+            FOUND_TYPE_B="$TYPE"
+
+            if [[ -z "$FOUND_NODE_B" || -z "$FOUND_TYPE_B" ]]; then
+                RESULTS+="FAIL $OLD_ID → $NEW_ID (noeud/type indéterminé)\n"
+                (( FAIL_COUNT++ )) || true
+                continue
+            fi
+
+            if ! check_vm_stopped "$FOUND_NODE_B" "$OLD_ID" "$FOUND_TYPE_B"; then
+                RESULTS+="SKIP $OLD_ID → $NEW_ID (VM non arretee)\n"
+                (( FAIL_COUNT++ )) || true
+                continue
+            fi
+
+            local BFILE=""
+            [[ "$DRY_RUN" == "false" ]] && \
+                BFILE=$(backup_config "$FOUND_NODE_B" "$OLD_ID" "$FOUND_TYPE_B")
+
+            if rename_vmid "$OLD_ID" "$NEW_ID" "$FOUND_TYPE_B" "$FOUND_NODE_B"; then
+                RESULTS+="OK   $OLD_ID → $NEW_ID ($FOUND_TYPE_B sur $FOUND_NODE_B)\n"
+                (( SUCCESS_COUNT++ )) || true
+            else
+                RESULTS+="FAIL $OLD_ID → $NEW_ID (erreur renommage)\n"
+                [[ "$DRY_RUN" == "false" ]] && \
+                    rollback_rename "$OLD_ID" "$NEW_ID" "$FOUND_TYPE_B" "$FOUND_NODE_B" "$BFILE"
+                (( FAIL_COUNT++ )) || true
+            fi
+        else
+            RESULTS+="FAIL $OLD_ID → $NEW_ID (non trouve)\n"
+            (( FAIL_COUNT++ )) || true
+        fi
+
+    done < "$BATCH_FILE"
+
+    dialog --title "Resultats Batch" \
+        --msgbox "$(echo -e "Resultats:\n\n${RESULTS}\nSucces: $SUCCESS_COUNT | Echecs: $FAIL_COUNT\nLog: $LOGFILE")" \
+        28 75
+}
+
+# ─────────────────────────────────────────
+# 🔀 TOGGLE DRY-RUN
+# ─────────────────────────────────────────
+toggle_dry_run() {
+    if [[ "$DRY_RUN" == "false" ]]; then
+        DRY_RUN=true
+        dialog --msgbox "Mode DRY-RUN ACTIVÉ\n\nAucune modification ne sera effectuée.\nToutes les actions seront simulées et loggées." 8 55
+        log "INFO" "Mode dry-run activé"
+    else
+        DRY_RUN=false
+        dialog --msgbox "Mode DRY-RUN DÉSACTIVÉ\n\nLes modifications seront appliquées réellement." 8 55
+        log "INFO" "Mode dry-run désactivé"
+    fi
+}
+
+# ─────────────────────────────────────────
+# ℹ️ INFOS VMID
+# ─────────────────────────────────────────
+info_vmid() {
+    local VMID
+    VMID=$(dialog --stdout \
+        --title "Infos VMID" \
+        --inputbox "Entrez le VMID a inspecter:" \
+        8 45) || return
+
+    VMID="${VMID//[$'\t\r\n ']/}"
+
+    if find_vmid "$VMID"; then
+        local FN="$NODE_ASSIGNED"
+        local FT="$TYPE"
+        local config
+        config=$(pvesh get "/nodes/$FN/$FT/$VMID/config" \
+            --output-format=json 2>/dev/null | head -40 || echo "Erreur lecture config")
+
+        # Snapshots
+        local snaps
+        snaps=$(pvesh get "/nodes/$FN/$FT/$VMID/snapshot" \
+            --output-format=json 2>/dev/null \
+            | grep -Po '"name"\s*:\s*"\K[^"]+' \
+            | grep -v "^current$" | tr '\n' ' ' || echo "aucun")
+
+        dialog --title "Infos VMID $VMID" \
+            --msgbox "Type:      $FT\nNoeud:     $FN\nSnapshots: $snaps\n\nConfig (extrait):\n$config" \
+            28 80
+    else
+        dialog --msgbox "VMID $VMID non trouvé." 6 40
     fi
 }
 
@@ -790,7 +979,7 @@ Confirmez-vous ce renommage?" \
 # ─────────────────────────────────────────
 view_logs() {
     if [[ -f "$LOGFILE" ]]; then
-        dialog --title "📝 Logs - $LOGFILE" \
+        dialog --title "Logs - $LOGFILE" \
             --textbox "$LOGFILE" \
             30 100
     else
@@ -799,32 +988,40 @@ view_logs() {
 }
 
 # ─────────────────────────────────────────
-# ℹ️ INFOS SUR UN VMID
+# 🎮 MENU PRINCIPAL
 # ─────────────────────────────────────────
-info_vmid() {
-    local VMID
-    VMID=$(dialog --stdout \
-        --title "ℹ️ Infos VMID" \
-        --inputbox "Entrez le VMID à inspecter:" \
-        8 45) || return
-    
-    VMID="${VMID//[$'\t\r\n ']/}"
-    
-    if find_vmid "$VMID"; then
-        local CONFIG
-        CONFIG=$(pvesh get "/nodes/$NODE_ASSIGNED/$TYPE/$VMID/config" \
-            --output-format=json 2>/dev/null || echo "{}")
-        
-        dialog --title "ℹ️ Infos VMID $VMID" \
-            --msgbox "Type: $TYPE\nNoeud: $NODE_ASSIGNED\n\nConfig:\n$CONFIG" \
-            25 80
-    else
-        dialog --msgbox "VMID $VMID non trouvé." 6 40
-    fi
+main_menu() {
+    while true; do
+        local dry_status
+        [[ "$DRY_RUN" == "true" ]] && dry_status="[DRY-RUN ON]" || dry_status=""
+
+        local CHOICE
+        CHOICE=$(dialog --stdout \
+            --title "PROXMOX VMID UPDATER v2.2 $dry_status" \
+            --menu "Noeuds: ${CLUSTER_NODES[*]}" \
+            18 65 8 \
+            "1" "Renommer un VMID (simple)" \
+            "2" "Lister toutes les VMs/LXCs" \
+            "3" "Mode Batch (CSV)" \
+            "4" "Infos sur un VMID" \
+            "5" "Voir les logs" \
+            "6" "Toggle Dry-Run (simulation) [$DRY_RUN]" \
+            "7" "Quitter") || { clear; exit 0; }
+
+        case "$CHOICE" in
+            1) single_rename_workflow ;;
+            2) list_all_vms ;;
+            3) batch_rename ;;
+            4) info_vmid ;;
+            5) view_logs ;;
+            6) toggle_dry_run ;;
+            7) clear; log "INFO" "Script terminé"; exit 0 ;;
+        esac
+    done
 }
 
 # ─────────────────────────────────────────
-# 🚀 POINT D'ENTRÉE PRINCIPAL
+# 🚀 MAIN
 # ─────────────────────────────────────────
 main() {
     show_banner
@@ -833,20 +1030,16 @@ main() {
     show_warning
     detect_cluster_nodes
     check_quorum
-    
+
     log_separator
-    log "INFO" "=== PROXMOX VMID UPDATER DÉMARRÉ ==="
+    log "INFO" "=== PROXMOX VMID UPDATER v2.2 DEMARRÉ ==="
     log "INFO" "Noeuds: ${CLUSTER_NODES[*]}"
-    log "INFO" "Log: $LOGFILE"
     log_separator
-    
+
     main_menu
-    
+
     clear
-    echo -e "${GREEN}✅ Script terminé. Log disponible: $LOGFILE${NC}"
+    echo -e "${GREEN}Script terminé. Log: $LOGFILE${NC}"
 }
 
-# ─────────────────────────────────────────
-# 🎯 LANCEMENT
-# ─────────────────────────────────────────
 main "$@"
