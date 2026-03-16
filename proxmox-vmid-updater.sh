@@ -416,7 +416,7 @@ rollback_rename() {
 
 # ─────────────────────────────────────────
 # 💽 RENOMMER LES VOLUMES DE STOCKAGE
-#    Gère local, ZFS et Ceph
+#    Gère : LVM, ZFS, Ceph RBD, fichiers (dir/raw/qcow2)
 # ─────────────────────────────────────────
 rename_storage_volumes() {
     local ID_OLD="$1"
@@ -425,108 +425,242 @@ rename_storage_volumes() {
     local LOCAL_NODE
     LOCAL_NODE=$(hostname -s)
 
-    log "INFO" "Renommage des volumes: $ID_OLD → $ID_NEW sur $NODE"
+    log "INFO" "=== Renommage volumes: $ID_OLD → $ID_NEW sur $NODE ==="
 
-    _do_rename_volumes() {
+    # ────────────────────────────────────────
+    # LVM  (ex: pve/vm-400-disk-0 → pve/vm-200-disk-0)
+    # ────────────────────────────────────────
+    _rename_lvm_volumes() {
+        if ! command -v lvs &>/dev/null; then return; fi
+
+        # Lister tous les LV dont le nom contient l'ancien ID
+        local lv_list
+        lv_list=$(lvs --noheadings -o vg_name,lv_name 2>/dev/null \
+            | awk '{print $1"/"$2}' \
+            | grep -E "(vm|lxc)-${ID_OLD}-" || true)
+
+        if [[ -z "$lv_list" ]]; then
+            log "INFO" "LVM: aucun volume trouvé pour ID $ID_OLD"
+            return
+        fi
+
+        while IFS= read -r vg_lv; do
+            local vg lv_old lv_new
+            vg="${vg_lv%%/*}"
+            lv_old="${vg_lv##*/}"
+            # Remplace l'ID dans le nom du LV
+            lv_new="${lv_old//-${ID_OLD}-/-${ID_NEW}-}"
+
+            if [[ "$lv_old" == "$lv_new" ]]; then continue; fi
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log "DRYRUN" "lvrename $vg/$lv_old → $vg/$lv_new"
+            else
+                log "INFO" "LVM: lvrename $vg/$lv_old → $vg/$lv_new"
+                if lvrename "$vg" "$lv_old" "$lv_new" 2>>"$LOGFILE"; then
+                    log "SUCCESS" "LVM renommé: $vg/$lv_old → $vg/$lv_new"
+                else
+                    log "ERROR" "LVM rename échoué: $vg/$lv_old (voir $LOGFILE)"
+                fi
+            fi
+        done <<< "$lv_list"
+    }
+
+    # ────────────────────────────────────────
+    # Mise à jour des références LVM dans la config
+    # (la conf pointe vers local-lvm:vm-400-disk-0)
+    # ────────────────────────────────────────
+    _update_conf_lvm_refs() {
+        local conf_file="$1"
+        if [[ ! -f "$conf_file" ]]; then return; fi
+        # Remplace vm-400- par vm-200- et lxc-400- par lxc-200- dans la conf
+        sed -i "s/vm-${ID_OLD}-disk/vm-${ID_NEW}-disk/g"  "$conf_file"
+        sed -i "s/lxc-${ID_OLD}-disk/lxc-${ID_NEW}-disk/g" "$conf_file"
+        log "INFO" "Refs LVM mises à jour dans: $conf_file"
+    }
+
+    # ────────────────────────────────────────
+    # ZFS  (ex: rpool/data/vm-400-disk-0)
+    # ────────────────────────────────────────
+    _rename_zfs_volumes() {
+        if ! command -v zfs &>/dev/null; then return; fi
+
+        while IFS= read -r zvol; do
+            local new_zvol="${zvol//-${ID_OLD}-/-${ID_NEW}-}"
+            if [[ "$zvol" == "$new_zvol" ]]; then continue; fi
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log "DRYRUN" "zfs rename: $zvol → $new_zvol"
+            else
+                if zfs rename "$zvol" "$new_zvol" 2>>"$LOGFILE"; then
+                    log "SUCCESS" "ZFS: $zvol → $new_zvol"
+                else
+                    log "WARN" "ZFS rename échoué: $zvol"
+                fi
+            fi
+        done < <(zfs list -H -o name 2>/dev/null \
+            | grep -E "(vm|lxc)-${ID_OLD}-" || true)
+    }
+
+    # ────────────────────────────────────────
+    # Ceph RBD  (ex: pool/vm-400-disk-0)
+    # ────────────────────────────────────────
+    _rename_ceph_volumes() {
+        if ! command -v rbd &>/dev/null; then return; fi
+
+        local pools
+        pools=$(ceph osd pool ls 2>/dev/null || true)
+        while IFS= read -r pool; do
+            [[ -z "$pool" ]] && continue
+            while IFS= read -r img; do
+                local new_img="${img//-${ID_OLD}-/-${ID_NEW}-}"
+                if [[ "$img" == "$new_img" ]]; then continue; fi
+
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log "DRYRUN" "rbd mv: $pool/$img → $pool/$new_img"
+                else
+                    if rbd mv "$pool/$img" "$pool/$new_img" 2>>"$LOGFILE"; then
+                        log "SUCCESS" "Ceph RBD: $pool/$img → $pool/$new_img"
+                    else
+                        log "WARN" "RBD rename échoué: $pool/$img"
+                    fi
+                fi
+            done < <(rbd ls "$pool" 2>/dev/null \
+                | grep -E "(vm|lxc)-${ID_OLD}-" || true)
+        done <<< "$pools"
+    }
+
+    # ────────────────────────────────────────
+    # Fichiers/dossiers classiques
+    # (stockage de type dir, raw, qcow2 dans /var/lib/vz)
+    # ────────────────────────────────────────
+    _rename_file_volumes() {
         local search_dirs=("/var/lib/vz" "/mnt/pve")
 
         for base_dir in "${search_dirs[@]}"; do
             [[ ! -d "$base_dir" ]] && continue
 
-            # Dossiers
+            # Dossiers d'abord (évite de casser les chemins des fichiers dedans)
             while IFS= read -r found_dir; do
                 local new_dir="${found_dir//$ID_OLD/$ID_NEW}"
-                if [[ "$found_dir" != "$new_dir" ]]; then
-                    if [[ "$DRY_RUN" == "true" ]]; then
-                        log "DRYRUN" "mv dossier: $found_dir → $new_dir"
-                    else
-                        mv "$found_dir" "$new_dir"
-                        log "SUCCESS" "Dossier: $found_dir → $new_dir"
-                    fi
+                [[ "$found_dir" == "$new_dir" ]] && continue
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log "DRYRUN" "mv dir: $found_dir → $new_dir"
+                else
+                    mv "$found_dir" "$new_dir" \
+                        && log "SUCCESS" "Dir: $found_dir → $new_dir" \
+                        || log "WARN" "mv dir échoué: $found_dir"
                 fi
-            done < <(find "$base_dir" -maxdepth 5 -type d -name "*${ID_OLD}*" 2>/dev/null || true)
+            done < <(find "$base_dir" -maxdepth 5 -type d -name "*${ID_OLD}*" 2>/dev/null \
+                | sort -r || true)   # sort -r: traiter les sous-dossiers en premier
 
             # Fichiers
             while IFS= read -r found_file; do
                 local new_file="${found_file//$ID_OLD/$ID_NEW}"
-                if [[ "$found_file" != "$new_file" ]]; then
-                    if [[ "$DRY_RUN" == "true" ]]; then
-                        log "DRYRUN" "mv fichier: $found_file → $new_file"
-                    else
-                        mv "$found_file" "$new_file"
-                        log "SUCCESS" "Fichier: $found_file → $new_file"
-                    fi
+                [[ "$found_file" == "$new_file" ]] && continue
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log "DRYRUN" "mv file: $found_file → $new_file"
+                else
+                    mv "$found_file" "$new_file" \
+                        && log "SUCCESS" "File: $found_file → $new_file" \
+                        || log "WARN" "mv file échoué: $found_file"
                 fi
             done < <(find "$base_dir" -maxdepth 5 -type f -name "*${ID_OLD}*" 2>/dev/null || true)
         done
     }
 
-    # ── ZFS ──
-    _rename_zfs_volumes() {
-        if command -v zfs &>/dev/null; then
-            while IFS= read -r zvol; do
-                local new_zvol="${zvol//$ID_OLD/$ID_NEW}"
-                if [[ "$zvol" != "$new_zvol" ]]; then
-                    if [[ "$DRY_RUN" == "true" ]]; then
-                        log "DRYRUN" "zfs rename: $zvol → $new_zvol"
-                    else
-                        zfs rename "$zvol" "$new_zvol" \
-                            && log "SUCCESS" "ZFS: $zvol → $new_zvol" \
-                            || log "WARN" "ZFS rename échoué: $zvol"
-                    fi
-                fi
-            done < <(zfs list -H -o name 2>/dev/null | grep "$ID_OLD" || true)
-        fi
-    }
-
-    # ── Ceph RBD ──
-    _rename_ceph_volumes() {
-        if command -v rbd &>/dev/null; then
-            local pools
-            pools=$(ceph osd pool ls 2>/dev/null || true)
-            while IFS= read -r pool; do
-                while IFS= read -r img; do
-                    local new_img="${img//$ID_OLD/$ID_NEW}"
-                    if [[ "$img" != "$new_img" ]]; then
-                        if [[ "$DRY_RUN" == "true" ]]; then
-                            log "DRYRUN" "rbd mv: $pool/$img → $pool/$new_img"
-                        else
-                            rbd mv "$pool/$img" "$pool/$new_img" \
-                                && log "SUCCESS" "Ceph RBD: $pool/$img → $pool/$new_img" \
-                                || log "WARN" "RBD rename échoué: $pool/$img"
-                        fi
-                    fi
-                done < <(rbd ls "$pool" 2>/dev/null | grep "$ID_OLD" || true)
-            done <<< "$pools"
-        fi
-    }
-
+    # ────────────────────────────────────────
+    # Dispatch local vs distant
+    # ────────────────────────────────────────
     if [[ "$NODE" == "$LOCAL_NODE" ]]; then
-        _do_rename_volumes
+        _rename_lvm_volumes
+
+        # Mettre à jour les refs LVM dans la NOUVELLE config (déjà renommée)
+        local new_conf_dir
+        if [[ "${_CURRENT_TYPE:-}" == "qemu" ]]; then
+            new_conf_dir="/etc/pve/nodes/$NODE/qemu-server"
+        else
+            new_conf_dir="/etc/pve/nodes/$NODE/lxc"
+        fi
+        _update_conf_lvm_refs "$new_conf_dir/$ID_NEW.conf"
+
         _rename_zfs_volumes
         _rename_ceph_volumes
+        _rename_file_volumes
     else
-        ssh -o StrictHostKeyChecking=no "root@$NODE" \
-            "find /var/lib/vz /mnt/pve -maxdepth 5 \
-             \( -name '*${ID_OLD}*' \) 2>/dev/null | \
-             while IFS= read -r f; do \
-                 nf=\"\${f//$ID_OLD/$ID_NEW}\"; \
-                 [ \"\$f\" != \"\$nf\" ] && mv \"\$f\" \"\$nf\" && echo \"Renommé: \$f\"; \
-             done || true" 2>/dev/null \
-            && log "SUCCESS" "Volumes distants renommés sur $NODE" \
-            || log "WARN" "Erreur volumes distants sur $NODE (non bloquant)"
+        # Exécution distante via SSH — on envoie un bloc complet
+        log "INFO" "Renommage volumes distants sur $NODE via SSH"
+        ssh -o StrictHostKeyChecking=no "root@$NODE" bash -s \
+            "$ID_OLD" "$ID_NEW" "$DRY_RUN" \
+            "${_CURRENT_TYPE:-lxc}" "$NODE" << 'REMOTE_SCRIPT'
+            ID_OLD="$1"; ID_NEW="$2"; DRY_RUN="$3"; CTYPE="$4"; NODE="$5"
 
-        # ZFS distant
-        ssh -o StrictHostKeyChecking=no "root@$NODE" \
-            "command -v zfs &>/dev/null && \
-             zfs list -H -o name 2>/dev/null | grep '$ID_OLD' | \
-             while IFS= read -r z; do \
-                 nz=\"\${z//$ID_OLD/$ID_NEW}\"; \
-                 [ \"\$z\" != \"\$nz\" ] && zfs rename \"\$z\" \"\$nz\" && echo \"ZFS: \$z\"; \
-             done || true" 2>/dev/null || true
+            # LVM distant
+            if command -v lvs &>/dev/null; then
+                lvs --noheadings -o vg_name,lv_name 2>/dev/null \
+                    | awk '{print $1"/"$2}' \
+                    | grep -E "(vm|lxc)-${ID_OLD}-" \
+                    | while IFS= read -r vg_lv; do
+                        vg="${vg_lv%%/*}"; lv_old="${vg_lv##*/}"
+                        lv_new="${lv_old//-${ID_OLD}-/-${ID_NEW}-}"
+                        [ "$lv_old" = "$lv_new" ] && continue
+                        if [ "$DRY_RUN" = "true" ]; then
+                            echo "[DRY-RUN] lvrename $vg/$lv_old → $lv_new"
+                        else
+                            lvrename "$vg" "$lv_old" "$lv_new" \
+                                && echo "[OK] LVM: $lv_old → $lv_new" \
+                                || echo "[WARN] LVM échoué: $lv_old"
+                        fi
+                    done || true
+            fi
+
+            # Mise à jour refs LVM dans conf distante
+            if [ "$CTYPE" = "qemu" ]; then
+                CONF="/etc/pve/nodes/$NODE/qemu-server/${ID_NEW}.conf"
+            else
+                CONF="/etc/pve/nodes/$NODE/lxc/${ID_NEW}.conf"
+            fi
+            [ -f "$CONF" ] && \
+                sed -i "s/vm-${ID_OLD}-disk/vm-${ID_NEW}-disk/g;
+                        s/lxc-${ID_OLD}-disk/lxc-${ID_NEW}-disk/g" "$CONF" && \
+                echo "[OK] Refs LVM màj dans $CONF" || true
+
+            # ZFS distant
+            if command -v zfs &>/dev/null; then
+                zfs list -H -o name 2>/dev/null | grep -E "(vm|lxc)-${ID_OLD}-" \
+                    | while IFS= read -r z; do
+                        nz="${z//-${ID_OLD}-/-${ID_NEW}-}"
+                        [ "$z" = "$nz" ] && continue
+                        if [ "$DRY_RUN" = "true" ]; then
+                            echo "[DRY-RUN] zfs rename $z → $nz"
+                        else
+                            zfs rename "$z" "$nz" \
+                                && echo "[OK] ZFS: $z → $nz" \
+                                || echo "[WARN] ZFS échoué: $z"
+                        fi
+                    done || true
+            fi
+
+            # Fichiers distants
+            for base in /var/lib/vz /mnt/pve; do
+                [ -d "$base" ] || continue
+                find "$base" -maxdepth 5 \( -name "*${ID_OLD}*" \) 2>/dev/null \
+                    | sort -r \
+                    | while IFS= read -r f; do
+                        nf="${f//$ID_OLD/$ID_NEW}"
+                        [ "$f" = "$nf" ] && continue
+                        if [ "$DRY_RUN" = "true" ]; then
+                            echo "[DRY-RUN] mv $f → $nf"
+                        else
+                            mv "$f" "$nf" && echo "[OK] mv: $f → $nf" || echo "[WARN] mv échoué: $f"
+                        fi
+                    done || true
+            done
+REMOTE_SCRIPT
+        log "SUCCESS" "Volumes distants traités sur $NODE"
     fi
 
-    log "INFO" "Renommage volumes terminé"
+    log "INFO" "=== Renommage volumes terminé ==="
 }
 
 # ─────────────────────────────────────────
@@ -583,6 +717,9 @@ rename_vmid() {
         return 0
     fi
 
+    # Expose le type courant pour rename_storage_volumes (refs LVM)
+    _CURRENT_TYPE="$TYPE"
+
     # ── Exécution réelle ──
     if [[ "$NODE" == "$LOCAL_NODE" ]]; then
         log "INFO" "Renommage LOCAL sur $NODE"
@@ -591,11 +728,16 @@ rename_vmid() {
             || { log "ERROR" "Echec copie config"; return 1; }
         log "SUCCESS" "Config copiée: $ID_OLD.conf → $ID_NEW.conf"
 
-        sed -i "s|/$ID_OLD/|/$ID_NEW/|g" "$CONF_NEW"
-        sed -i "s|-$ID_OLD-|-$ID_NEW-|g" "$CONF_NEW"
-        sed -i "s|:$ID_OLD/|:$ID_NEW/|g" "$CONF_NEW"
-        log "INFO" "Références internes mises à jour"
+        # Remplacements génériques
+        sed -i "s|/$ID_OLD/|/$ID_NEW/|g"  "$CONF_NEW"
+        sed -i "s|-$ID_OLD-|-$ID_NEW-|g"  "$CONF_NEW"
+        sed -i "s|:$ID_OLD/|:$ID_NEW/|g"  "$CONF_NEW"
+        # Remplacements explicites LVM (local-lvm:vm-400-disk-0 → vm-200-disk-0)
+        sed -i "s|vm-${ID_OLD}-disk|vm-${ID_NEW}-disk|g"   "$CONF_NEW"
+        sed -i "s|lxc-${ID_OLD}-disk|lxc-${ID_NEW}-disk|g" "$CONF_NEW"
+        log "INFO" "Références config mises à jour (génériques + LVM)"
 
+        # Renommer les volumes (LVM, ZFS, Ceph, fichiers)
         rename_storage_volumes "$ID_OLD" "$ID_NEW" "$NODE"
 
         rm -f "$CONF_OLD"
@@ -606,13 +748,15 @@ rename_vmid() {
 
         ssh -o StrictHostKeyChecking=no "root@$NODE" \
             "cp \"$CONF_OLD\" \"$CONF_NEW\" && \
-             sed -i \"s|/$ID_OLD/|/$ID_NEW/|g\" \"$CONF_NEW\" && \
-             sed -i \"s|-$ID_OLD-|-$ID_NEW-|g\" \"$CONF_NEW\" && \
-             sed -i \"s|:$ID_OLD/|:$ID_NEW/|g\" \"$CONF_NEW\" && \
+             sed -i \"s|/$ID_OLD/|/$ID_NEW/|g\"            \"$CONF_NEW\" && \
+             sed -i \"s|-$ID_OLD-|-$ID_NEW-|g\"            \"$CONF_NEW\" && \
+             sed -i \"s|:$ID_OLD/|:$ID_NEW/|g\"            \"$CONF_NEW\" && \
+             sed -i \"s|vm-${ID_OLD}-disk|vm-${ID_NEW}-disk|g\"   \"$CONF_NEW\" && \
+             sed -i \"s|lxc-${ID_OLD}-disk|lxc-${ID_NEW}-disk|g\" \"$CONF_NEW\" && \
              rm -f \"$CONF_OLD\"" \
             || { log "ERROR" "Echec SSH sur $NODE"; return 1; }
 
-        log "SUCCESS" "Renommage distant OK sur $NODE"
+        log "SUCCESS" "Renommage distant config OK sur $NODE"
         rename_storage_volumes "$ID_OLD" "$ID_NEW" "$NODE"
     fi
 
